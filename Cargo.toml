@@ -1,0 +1,20 @@
+[package]
+name = "iota-consistency-check"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.98"
+backoff = { version = "0.4.0", features = ["futures"] }
+clap = { version = "4.5.41", features = ["derive", "env"] }
+futures = "0.3.31"
+iota-config = { git = "https://github.com/iotaledger/iota.git" }
+iota-data-ingestion-core = { git = "https://github.com/iotaledger/iota.git" }
+iota-kvstore = { git = "https://github.com/iotaledger/iota.git" }
+iota-storage = { git = "https://github.com/iotaledger/iota.git" }
+iota-types = { git = "https://github.com/iotaledger/iota.git" }
+number_range = "0.3.2"
+strum = { version = "0.27.2", features = ["derive", "strum_macros"] }
+tokio = "1.47.0"
+tracing = "0.1.41"
+tracing-subscriber = "0.3.19"
