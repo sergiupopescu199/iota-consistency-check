@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use iota_storage::{
     http_key_value_store::HttpKVStore, key_value_store_metrics::KeyValueStoreMetrics,
 };
@@ -7,7 +9,7 @@ use crate::{historical_checkpoint_reader::HistoricalCheckpointReader, types::Net
 
 pub async fn run(network: Network, checkpoints: Vec<usize>) -> anyhow::Result<()> {
     let metrics = KeyValueStoreMetrics::new_for_tests();
-    let rest_kv = HttpKVStore::new(&network.rest_api_url(), 100, metrics)?;
+    let rest_kv = HttpKVStore::new(&network.rest_api_url(), 100, metrics).map(Arc::new)?;
 
     let mut reader = HistoricalCheckpointReader::new(network).await?;
     reader.check_for_available_checkpoints(&checkpoints).await?;
@@ -23,7 +25,8 @@ pub async fn run(network: Network, checkpoints: Vec<usize>) -> anyhow::Result<()
         let span = tracing::info_span!("Checkpoint", sequence_number,);
         let _enter = span.enter();
         info!("starting validation");
-        validate::checkpoint_consistency(&rest_kv, &checkpoint, &transactions, &objects).await?;
+        validate::checkpoint_consistency(rest_kv.clone(), &checkpoint, &transactions, &objects)
+            .await?;
         info!("validation completed successfully");
     }
 
@@ -33,7 +36,7 @@ pub async fn run(network: Network, checkpoints: Vec<usize>) -> anyhow::Result<()
 }
 
 mod validate {
-    use std::{collections::HashSet, time::Duration};
+    use std::{collections::HashSet, sync::Arc, time::Duration};
 
     use anyhow::{anyhow, bail};
     use backoff::{ExponentialBackoff, backoff::Backoff};
@@ -64,14 +67,38 @@ mod validate {
     /// BigTable KV store through the KV REST API.
     #[instrument(skip_all, fields(objects_count = chk_objects.len(), transactions_count = chk_transactions.len()))]
     pub(super) async fn checkpoint_consistency(
-        client: &HttpKVStore,
+        client: Arc<HttpKVStore>,
         chk_checkpoint: &Checkpoint,
         chk_transactions: &[TransactionData],
         chk_objects: &[Object],
     ) -> anyhow::Result<()> {
-        objects(client, chk_objects).await?;
-        transactions(client, chk_transactions).await?;
-        checkpoint(client, chk_checkpoint).await
+        let objects_task = {
+            let client = Arc::clone(&client);
+            let chk_objects = chk_objects.to_vec();
+            tokio::spawn(objects(client, chk_objects))
+        };
+
+        let transactions_task = {
+            let client = Arc::clone(&client);
+            let chk_transactions = chk_transactions.to_vec();
+            tokio::spawn(transactions(client, chk_transactions))
+        };
+
+        let checkpoint_task = {
+            let client = Arc::clone(&client);
+            let chk_checkpoint = chk_checkpoint.clone();
+            tokio::spawn(checkpoint(client, chk_checkpoint))
+        };
+
+        // Wait for all tasks to complete
+        let (objects_result, transactions_result, checkpoint_result) =
+            tokio::try_join!(objects_task, transactions_task, checkpoint_task)?;
+
+        objects_result?;
+        transactions_result?;
+        checkpoint_result?;
+
+        Ok(())
     }
 
     /// Validates object consistency between checkpoint data and the KV REST
@@ -81,14 +108,13 @@ mod validate {
     /// KV REST API that correspond to the objects present in the checkpoint
     /// data, then performs a comprehensive comparison to ensure data
     /// consistency.
-    async fn objects(client: &HttpKVStore, objects: &[Object]) -> anyhow::Result<()> {
-        let mut kv_store_objs = HashSet::<&Object>::from_iter(objects.iter());
+    async fn objects(client: Arc<HttpKVStore>, objects: Vec<Object>) -> anyhow::Result<()> {
+        let mut kv_store_objs = HashSet::<Object>::from_iter(objects.iter().cloned());
 
-        let mut stream = stream::iter(
-            objects
-                .iter()
-                .map(|object| fetch_object_with_retry(client, object.id(), object.version())),
-        )
+        let mut stream = stream::iter(objects.into_iter().map(|object| {
+            let client = Arc::clone(&client);
+            fetch_object_with_retry(client, object.id(), object.version())
+        }))
         .buffered(MAX_ITEMS_TO_FETCH);
 
         while let Some(kv) = stream.next().await {
@@ -99,7 +125,7 @@ mod validate {
         if !kv_store_objs.is_empty() {
             bail!("Object validation failed - some object not found in REST API");
         }
-
+        info!("- objects matches!");
         Ok(())
     }
 
@@ -110,7 +136,7 @@ mod validate {
     /// high load and may return an Option::None even tough the value is
     /// present, this behavior was only manifested for genesis checkpoint.
     async fn fetch_object_with_retry(
-        client: &HttpKVStore,
+        client: Arc<HttpKVStore>,
         object_id: ObjectID,
         version: SequenceNumber,
     ) -> anyhow::Result<Object> {
@@ -195,8 +221,8 @@ mod validate {
     /// in the checkpoint data, then performs a comprehensive comparison to
     /// ensure data consistency.
     async fn transactions(
-        client: &HttpKVStore,
-        transactions: &[TransactionData],
+        client: Arc<HttpKVStore>,
+        transactions: Vec<TransactionData>,
     ) -> anyhow::Result<()> {
         let tx_digests = transactions
             .iter()
@@ -208,27 +234,33 @@ mod validate {
         let mut kv_events = Vec::<Option<TransactionEvents>>::with_capacity(tx_digests.len());
 
         for digests in tx_digests.chunks(CHUNK_SIZE) {
-            let (tx, effects) = fetch_transactions_with_retry(client, digests).await?;
+            let (tx, effects) = fetch_transactions_with_retry(&client, digests).await?;
             let tx_events = client.multi_get_events_by_tx_digests(&tx_digests).await?;
             kv_transactions.extend(tx);
             kv_effects.extend(effects);
             kv_events.extend(tx_events);
         }
 
-        if !transactions
-            .iter()
-            .zip(kv_transactions)
-            .zip(kv_effects)
-            .zip(kv_events)
-            .all(|(((tx, kv_tx), kv_eff), kv_events)| {
-                tx.transaction == kv_tx && tx.effects == kv_eff && tx.events == kv_events
-            })
-        {
+        info!("- Checking transactions");
+        let transactions_clone = transactions.clone();
+        let is_valid = tokio::task::spawn_blocking(move || {
+            transactions_clone
+                .iter()
+                .zip(kv_transactions.iter())
+                .zip(kv_effects.iter())
+                .zip(kv_events.iter())
+                .all(|(((tx, kv_tx), kv_eff), kv_events)| {
+                    tx.transaction == *kv_tx && tx.effects == *kv_eff && tx.events == *kv_events
+                })
+        })
+        .await?;
+
+        if !is_valid {
             bail!(
                 "Tx validation failed - mismatch between checkpoint and REST API transaction events"
             );
         }
-
+        info!("- transactions matches!");
         Ok(())
     }
 
@@ -239,7 +271,7 @@ mod validate {
     /// through the KV REST API using the sequence number and performs a
     /// comprehensive comparison with the checkpoint to ensure data
     /// integrity.
-    async fn checkpoint(client: &HttpKVStore, checkpoint: &Checkpoint) -> anyhow::Result<()> {
+    async fn checkpoint(client: Arc<HttpKVStore>, checkpoint: Checkpoint) -> anyhow::Result<()> {
         let (sum_by_seq, contents, sum_by_digest) = client
             .multi_get_checkpoints(
                 &[checkpoint.summary.sequence_number],
@@ -280,7 +312,7 @@ mod validate {
                 "Checkpoint validation failed - mismatch between expected and REST API checkpoint data"
             );
         }
-
+        info!("- checkpoint matches!");
         Ok(())
     }
 }
