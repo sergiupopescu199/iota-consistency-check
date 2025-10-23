@@ -1,4 +1,4 @@
-use std::num::NonZeroUsize;
+use std::{collections::BTreeSet, num::NonZeroUsize};
 
 use anyhow::{Context, bail};
 use iota_config::{
@@ -85,6 +85,21 @@ impl HistoricalCheckpointReader {
                 .filter(|c| checkpoints.contains(&(c.checkpoint_summary.sequence_number as usize)));
 
             downloaded_checkpoints.extend(fetched_checkpoints);
+        }
+
+        let downloaded_seqs = downloaded_checkpoints
+            .iter()
+            .map(|c| c.checkpoint_summary.sequence_number as usize)
+            .collect::<BTreeSet<_>>();
+
+        let mut requested = BTreeSet::from_iter(checkpoints.iter().copied());
+
+        for seq in &downloaded_seqs {
+            requested.remove(seq);
+        }
+
+        if !requested.is_empty() {
+            bail!("historical is missing checkpoints: {:?}", requested);
         }
 
         Ok(downloaded_checkpoints)
