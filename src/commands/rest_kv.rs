@@ -42,11 +42,12 @@ mod validate {
     use backoff::{ExponentialBackoff, backoff::Backoff};
     use futures::{StreamExt, stream};
     use iota_kvstore::{Checkpoint, TransactionData};
+    use iota_sdk_types::ObjectId;
     use iota_storage::{
         http_key_value_store::HttpKVStore, key_value_store::TransactionKeyValueStoreTrait,
     };
     use iota_types::{
-        base_types::{ObjectID, SequenceNumber},
+        base_types::SequenceNumber,
         digests::TransactionDigest,
         effects::{TransactionEffects, TransactionEvents},
         object::Object,
@@ -137,7 +138,7 @@ mod validate {
     /// present, this behavior was only manifested for genesis checkpoint.
     async fn fetch_object_with_retry(
         client: Arc<HttpKVStore>,
-        object_id: ObjectID,
+        object_id: ObjectId,
         version: SequenceNumber,
     ) -> anyhow::Result<Object> {
         let mut backoff = ExponentialBackoff::default();

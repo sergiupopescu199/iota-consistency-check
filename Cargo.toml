@@ -13,6 +13,7 @@ iota-data-ingestion-core = { git = "https://github.com/iotaledger/iota.git" }
 iota-kvstore = { git = "https://github.com/iotaledger/iota.git" }
 iota-storage = { git = "https://github.com/iotaledger/iota.git" }
 iota-types = { git = "https://github.com/iotaledger/iota.git" }
+iota-sdk-types = { git = "https://github.com/iotaledger/iota-rust-sdk.git", rev = "e7af68b7ed6428dbb1e2bb434c6692993d41e9c3", default-features = false }
 number_range = "0.3.2"
 strum = { version = "0.27.2", features = ["derive", "strum_macros"] }
 tokio = "1.47.0"
